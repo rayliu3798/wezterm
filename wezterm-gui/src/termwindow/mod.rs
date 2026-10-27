@@ -1302,12 +1302,16 @@ impl TermWindow {
                 MuxNotification::SaveToDownloads { .. } => {
                     // Handled by frontend
                 }
-                MuxNotification::PaneFocused(_) => {
+                MuxNotification::PaneFocused(_) | MuxNotification::PaneFocusReconciled(_) => {
                     // Also handled by clientpane
                     self.update_title_post_status();
                 }
-                MuxNotification::TabResized(_) => {
-                    // Also handled by wezterm-client
+                MuxNotification::TabResized(tab_id) => {
+                    // Resync can replace the whole tab with a remote snapshot
+                    // whose size no longer matches this physical window.
+                    if let Some(tab) = Mux::get().get_tab(tab_id) {
+                        tab.resize_to_viewport(self.terminal_size);
+                    }
                     self.update_title_post_status();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
@@ -1470,6 +1474,7 @@ impl TermWindow {
                     | Alert::Bell,
             }
             | MuxNotification::PaneFocused(pane_id)
+            | MuxNotification::PaneFocusReconciled(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
             | MuxNotification::PaneOutput(pane_id) => {
                 // Check window validity and propagate to the window event handler

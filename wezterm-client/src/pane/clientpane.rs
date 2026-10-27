@@ -229,9 +229,28 @@ impl ClientPane {
                 // it here.
                 log::trace!("advised of remote pane focus: {pane_id}");
 
+                // Record the server's decision before applying it locally.
+                // `focus_changed(true)` will then see that this remote pane is
+                // already focused and won't echo a SetFocusedPane request.
+                {
+                    let mut focused = self.client.focused_remote_pane_id.lock().unwrap();
+                    *focused = Some(pane_id);
+                }
+
                 let mux = Mux::get();
-                if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
+                if let Err(err) = mux.reconcile_pane_focus(self.local_pane_id) {
+                    // Don't let a failed reconciliation suppress a later local
+                    // attempt to report this pane to the server.
+                    let mut focused = self.client.focused_remote_pane_id.lock().unwrap();
+                    if *focused == Some(pane_id) {
+                        focused.take();
+                    }
                     log::error!("Error reconciling remote PaneFocused notification: {err:#}");
+                } else {
+                    // The PDU bypassed the local mux notification stream. Let
+                    // local UI subscribers repaint without triggering another
+                    // focus reconciliation or forwarding anything upstream.
+                    mux.notify(MuxNotification::PaneFocusReconciled(self.local_pane_id));
                 }
             }
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
@@ -375,7 +394,9 @@ impl Pane for ClientPane {
         let remote_tab_id = self.remote_tab_id;
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
+        let layout = self.client.begin_layout_change(false);
         promise::spawn::spawn(async move {
+            let _completion = layout.wait().await;
             client
                 .client
                 .set_zoomed(SetPaneZoomed {
@@ -412,7 +433,9 @@ impl Pane for ClientPane {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
+            let layout = self.client.begin_layout_change(false);
             promise::spawn::spawn(async move {
+                let _completion = layout.wait().await;
                 client
                     .client
                     .resize(Resize {
@@ -512,7 +535,9 @@ impl Pane for ClientPane {
         }
 
         if send_kill {
+            let layout = self.client.begin_layout_change(true);
             promise::spawn::spawn(async move {
+                let _completion = layout.wait().await;
                 client
                     .client
                     .kill_pane(KillPane {

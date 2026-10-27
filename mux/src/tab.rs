@@ -20,6 +20,17 @@ pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
 
+/// Controls whether changing the active pane broadcasts [`MuxNotification::PaneFocused`].
+///
+/// Use [`NotifyMux::No`] only while applying a focus event that was already
+/// broadcast or received from another mux; normal focus actions must notify.
+/// See <https://github.com/wezterm/wezterm/issues/4390>.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NotifyMux {
+    Yes,
+    No,
+}
+
 #[derive(Default)]
 struct Recency {
     count: usize,
@@ -478,7 +489,16 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+fn apply_sizes_from_splits(tree: &mut Tree, size: &TerminalSize) {
+    let dims = cell_dimensions(size);
+    if let Tree::Node { data: Some(data), .. } = tree {
+        // A mux snapshot can contain siblings resized at different times.
+        // Reconcile each subtree against its parent, even when the root size
+        // did not change, rather than perpetuating a taller/wider child.
+        let prior = data.size();
+        adjust_x_size(tree, size.cols as isize - prior.cols as isize, &dims);
+        adjust_y_size(tree, size.rows as isize - prior.rows as isize, &dims);
+    }
     match tree {
         Tree::Empty => return,
         Tree::Node { data: None, .. } => return,
@@ -487,8 +507,23 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first);
-            apply_sizes_from_splits(&*right, &data.second);
+            match data.direction {
+                SplitDirection::Horizontal => {
+                    data.first.rows = size.rows;
+                    data.second.rows = size.rows;
+                }
+                SplitDirection::Vertical => {
+                    data.first.cols = size.cols;
+                    data.second.cols = size.cols;
+                }
+            }
+            for child_size in [&mut data.first, &mut data.second] {
+                child_size.pixel_width = child_size.cols * dims.pixel_width;
+                child_size.pixel_height = child_size.rows * dims.pixel_height;
+                child_size.dpi = size.dpi;
+            }
+            apply_sizes_from_splits(left, &data.first);
+            apply_sizes_from_splits(right, &data.second);
         }
         Tree::Leaf(pane) => {
             pane.resize(*size).ok();
@@ -611,6 +646,29 @@ impl Tab {
         self.inner.lock().resize(size)
     }
 
+    /// Reconcile a remote tab against the containing GUI viewport. Avoid a
+    /// notification cycle when the requested viewport is below split minima.
+    pub fn resize_to_viewport(&self, mut size: TerminalSize) {
+        if size.rows == 0 || size.cols == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        if inner.zoomed.is_none() {
+            let dims = cell_dimensions(&size);
+            let (min_cols, min_rows) = match inner.pane.as_mut() {
+                Some(tree) => compute_min_size(tree),
+                None => return,
+            };
+            size.cols = size.cols.max(min_cols);
+            size.rows = size.rows.max(min_rows);
+            size.pixel_width = size.cols * dims.pixel_width;
+            size.pixel_height = size.rows * dims.pixel_height;
+        }
+        if inner.size != size {
+            inner.resize(size);
+        }
+    }
+
     /// Called when running in the mux server after an individual pane
     /// has been resized.
     /// Because the split manipulation happened on the GUI we "lost"
@@ -699,7 +757,15 @@ impl Tab {
     }
 
     pub fn set_active_pane(&self, pane: &Arc<dyn Pane>) {
-        self.inner.lock().set_active_pane(pane)
+        self.set_active_pane_with_notify(pane, NotifyMux::Yes)
+    }
+
+    /// Activates `pane`, optionally broadcasting [`MuxNotification::PaneFocused`].
+    ///
+    /// Normal user actions should call [`Tab::set_active_pane`]. Suppression is
+    /// reserved for reconciling a focus event that has already been broadcast.
+    pub fn set_active_pane_with_notify(&self, pane: &Arc<dyn Pane>, notify_mux: NotifyMux) {
+        self.inner.lock().set_active_pane(pane, notify_mux)
     }
 
     pub fn set_active_idx(&self, pane_index: usize) {
@@ -1747,7 +1813,7 @@ impl TabInner {
         self.active
     }
 
-    fn set_active_pane(&mut self, pane: &Arc<dyn Pane>) {
+    fn set_active_pane(&mut self, pane: &Arc<dyn Pane>, notify_mux: NotifyMux) {
         let prior = self.get_active_pane();
 
         if is_pane(pane, &prior.as_ref()) {
@@ -1768,22 +1834,26 @@ impl TabInner {
         {
             self.active = item.index;
             self.recency.tag(item.index);
-            self.advise_focus_change(prior);
+            self.advise_focus_change(prior, notify_mux);
         }
     }
 
-    fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
+    fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>, notify_mux: NotifyMux) {
         let mux = Mux::get();
         let current = self.get_active_pane();
         match (prior, current) {
             (Some(prior), Some(current)) if prior.pane_id() != current.pane_id() => {
                 prior.focus_changed(false);
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if notify_mux == NotifyMux::Yes {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (None, Some(current)) => {
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if notify_mux == NotifyMux::Yes {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (Some(prior), None) => {
                 prior.focus_changed(false);
@@ -1798,7 +1868,7 @@ impl TabInner {
         let prior = self.get_active_pane();
         self.active = pane_index;
         self.recency.tag(pane_index);
-        self.advise_focus_change(prior);
+        self.advise_focus_change(prior, NotifyMux::Yes);
     }
 
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
@@ -1861,7 +1931,7 @@ impl TabInner {
         if keep_focus {
             self.set_active_idx(pane_index);
         } else {
-            self.advise_focus_change(Some(pane));
+            self.advise_focus_change(Some(pane), NotifyMux::Yes);
         }
         None
     }
@@ -2198,6 +2268,7 @@ impl Into<String> for SerdeUrl {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::client::ClientId;
     use crate::renderable::*;
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
@@ -2206,6 +2277,8 @@ mod test {
     use url::Url;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
+
+    static MUX_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     struct FakePane {
         id: PaneId,
@@ -2219,6 +2292,26 @@ mod test {
                 size: Mutex::new(size),
             })
         }
+    }
+
+    fn two_pane_tab(size: TerminalSize) -> (Arc<Tab>, Arc<dyn Pane>, Arc<dyn Pane>) {
+        let tab = Arc::new(Tab::new(&size));
+        let pane_1 = FakePane::new(1, size);
+        tab.assign_pane(&pane_1);
+        let pane_2 = FakePane::new(2, size);
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&pane_2))
+            .unwrap();
+        pane_1.resize(split.first).unwrap();
+        (tab, pane_1, pane_2)
     }
 
     impl Pane for FakePane {
@@ -2267,7 +2360,18 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                dpi: size.dpi,
+                reverse_video: false,
+            }
         }
 
         fn get_title(&self) -> String {
@@ -2519,6 +2623,168 @@ mod test {
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
         true
+    }
+
+    #[test]
+    fn user_pane_focus_emits_one_focus_notification() {
+        // A user-initiated focus change must retain the default broadcast.
+        let _guard = MUX_TEST_GUARD.lock();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let notified_panes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&notified_panes);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneFocused(pane_id) = notification {
+                recorded.lock().push(pane_id);
+            }
+            true
+        });
+
+        let (tab, pane_1, _pane_2) = two_pane_tab(size);
+
+        tab.set_active_pane(&pane_1);
+
+        assert_eq!(1, tab.get_active_pane().unwrap().pane_id());
+        assert_eq!(vec![1], *notified_panes.lock());
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn mux_focus_action_notifies_but_reconciliation_does_not() {
+        // Reconciliation applies an already-decided focus without feeding it
+        // back, while the normal user-action API must still broadcast.
+        let _guard = MUX_TEST_GUARD.lock();
+        let _executor = promise::spawn::ScopedExecutor::new();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let (tab, pane_1, pane_2) = two_pane_tab(size);
+
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&pane_1).unwrap();
+        mux.add_pane(&pane_2).unwrap();
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window).unwrap();
+
+        let notified_panes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&notified_panes);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneFocused(pane_id) = notification {
+                recorded.lock().push(pane_id);
+            }
+            true
+        });
+
+        mux.reconcile_pane_focus(1).unwrap();
+
+        assert_eq!(1, tab.get_active_pane().unwrap().pane_id());
+        assert!(notified_panes.lock().is_empty());
+
+        mux.focus_pane_and_containing_tab(2).unwrap();
+
+        assert_eq!(2, tab.get_active_pane().unwrap().pane_id());
+        assert_eq!(vec![2], *notified_panes.lock());
+
+        let client_id = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client_id));
+        mux.record_focus_metadata_for_client(&client_id, 1);
+        let client = mux
+            .iter_clients()
+            .into_iter()
+            .find(|client| client.client_id == client_id)
+            .unwrap();
+        assert_eq!(Some(1), client.focused_pane_id);
+        assert_eq!(vec![2], *notified_panes.lock());
+
+        drop(window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn resizing_same_size_repairs_inconsistent_remote_split_heights() {
+        let _guard = MUX_TEST_GUARD.lock();
+        let _executor = promise::spawn::ScopedExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let size = TerminalSize {
+            rows: 44,
+            cols: 180,
+            pixel_width: 2520,
+            pixel_height: 1408,
+            dpi: 144,
+        };
+        let (tab, _first, second) = two_pane_tab(size);
+        let third = FakePane::new(3, size);
+        tab.split_and_insert(1, SplitRequest::default(), Arc::clone(&third))
+            .unwrap();
+        for pane in [&second, &third] {
+            let dims = pane.get_dimensions();
+            pane.resize(TerminalSize {
+                rows: 66,
+                cols: dims.cols,
+                pixel_width: dims.pixel_width,
+                pixel_height: 2112,
+                dpi: 144,
+            })
+            .unwrap();
+        }
+        // The server can report a mixed snapshot during per-pane resizing.
+        // Its first child determines the root height despite taller siblings.
+        tab.rebuild_splits_sizes_from_contained_panes();
+        assert_eq!(44, tab.get_size().rows);
+        tab.resize(size);
+        for positioned in tab.iter_panes() {
+            assert_eq!(44, positioned.height, "split extends below the viewport");
+            assert_eq!(44, positioned.pane.get_dimensions().viewport_rows);
+        }
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn viewport_reconciliation_stops_at_split_minimum() {
+        let _guard = MUX_TEST_GUARD.lock();
+        let _executor = promise::spawn::ScopedExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let size = TerminalSize {
+            rows: 44, cols: 180, pixel_width: 2520, pixel_height: 1408, dpi: 144,
+        };
+        let (tab, _, _) = two_pane_tab(size);
+        let notifications = Arc::new(Mutex::new(0));
+        let recorded = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::TabResized(_)) {
+                *recorded.lock() += 1;
+            }
+            true
+        });
+        let tiny = TerminalSize {
+            rows: 1, cols: 1, pixel_width: 14, pixel_height: 32, dpi: 144,
+        };
+        tab.resize_to_viewport(tiny);
+        tab.resize_to_viewport(tiny);
+        assert_eq!(3, tab.get_size().cols);
+        assert_eq!(1, tab.get_size().rows);
+        assert_eq!(1, *notifications.lock(), "viewport correction must terminate");
+        Mux::shutdown();
     }
 
     #[test]

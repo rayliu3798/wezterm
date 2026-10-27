@@ -113,9 +113,15 @@ macro_rules! rpc {
     };
 }
 
-fn process_unilateral_inner(pane_id: PaneId, local_domain_id: DomainId, decoded: DecodedPdu) {
+fn process_unilateral_inner(
+    pane_id: PaneId,
+    local_domain_id: DomainId,
+    decoded: DecodedPdu,
+    pane_focus_ticket: Option<u64>,
+) {
     promise::spawn::spawn(async move {
-        process_unilateral_inner_async(pane_id, local_domain_id, decoded).await?;
+        process_unilateral_inner_async(pane_id, local_domain_id, decoded, pane_focus_ticket)
+            .await?;
         Ok::<(), anyhow::Error>(())
     })
     .detach();
@@ -125,6 +131,7 @@ async fn process_unilateral_inner_async(
     pane_id: PaneId,
     local_domain_id: DomainId,
     decoded: DecodedPdu,
+    pane_focus_ticket: Option<u64>,
 ) -> anyhow::Result<()> {
     let mux = match Mux::try_get() {
         Some(mux) => mux,
@@ -188,6 +195,11 @@ async fn process_unilateral_inner_async(
             decoded.pdu
         )
     })?;
+    if let Some(ticket) = pane_focus_ticket {
+        if !client_domain.is_current_pane_focus_ticket(ticket) {
+            return Ok(());
+        }
+    }
     client_pane.process_unilateral(decoded.pdu).await
 }
 
@@ -321,8 +333,21 @@ fn process_unilateral(
     }
 
     if let Some(pane_id) = decoded.pdu.pane_id() {
+        let pane_focus_ticket = if matches!(&decoded.pdu, Pdu::PaneFocused(_)) {
+            if let Some(domain) = Mux::try_get().and_then(|mux| mux.get_domain(local_domain_id)) {
+                if let Some(domain) = domain.downcast_ref::<ClientDomain>() {
+                    Some(domain.next_pane_focus_ticket())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         promise::spawn::spawn_into_main_thread(async move {
-            process_unilateral_inner(pane_id, local_domain_id, decoded)
+            process_unilateral_inner(pane_id, local_domain_id, decoded, pane_focus_ticket)
         })
         .detach();
     } else {
@@ -410,7 +435,12 @@ async fn client_thread_async(
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                                // A caller may cancel a single RPC while other
+                                // Client clones still use this connection.
+                                log::debug!(
+                                    "discarding response to cancelled RPC {}",
+                                    decoded.serial
+                                );
                             }
                         } else {
                             let reason =
@@ -1087,6 +1117,10 @@ impl Client {
                             Ok(_) => {
                                 backoff = BASE_INTERVAL;
                                 log::error!("Reconnected!");
+                                // The reader resumes only after this branch, so
+                                // invalidate old-socket focus work before any
+                                // PDU from the new connection can be received.
+                                ClientDomain::invalidate_pane_focus_tickets(local_domain_id);
                                 promise::spawn::spawn_into_main_thread(async move {
                                     ClientDomain::reattach(local_domain_id, ui).await.ok();
                                 })
@@ -1389,4 +1423,52 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn cancelled_rpc_does_not_disconnect_other_requests() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let socket = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        server.set_read_timeout(Some(Duration::from_secs(3)))?;
+        server.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let peer = thread::spawn(move || -> anyhow::Result<()> {
+            for _ in 0..2 {
+                let request = Pdu::decode(&mut server)?;
+                anyhow::ensure!(matches!(request.pdu, Pdu::Ping(_)), "expected Ping");
+                Pdu::Pong(Pong {}).encode(&mut server, request.serial)?;
+                server.flush()?;
+            }
+            Ok(())
+        });
+        let client = Client::new(
+            None,
+            Reconnectable::new(
+                ClientDomainConfig::Unix(UnixDomain::default()),
+                Some(Box::new(Async::new(socket)?)),
+            ),
+        );
+        let (promise, abandoned_response) = bounded(1);
+        drop(abandoned_response);
+        block_on(client.sender.send(ReaderMessage::SendPdu {
+            pdu: Pdu::Ping(Ping {}),
+            promise,
+        }))
+        .map_err(|_| anyhow!("reader stopped before first request"))?;
+
+        let result = block_on(smol::future::or(client.ping(), async {
+            smol::Timer::after(Duration::from_secs(3)).await;
+            Err(anyhow!("second request timed out"))
+        }));
+        drop(client);
+        let peer_result = peer.join().expect("test peer panicked");
+        result.context("cancelling one RPC disconnected another request")?;
+        peer_result?;
+        Ok(())
+    }
 }

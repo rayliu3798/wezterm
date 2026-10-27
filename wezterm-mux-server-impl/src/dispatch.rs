@@ -166,7 +166,10 @@ where
                     stream.flush().await.context("flushing PDU to client")?;
                 }
             }
-            Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
+            Ok(Item::Notif(
+                MuxNotification::PaneFocused(pane_id)
+                | MuxNotification::PaneFocusReconciled(pane_id),
+            )) => {
                 Pdu::PaneFocused(codec::PaneFocused { pane_id })
                     .encode_async(&mut stream, 0)
                     .await?;
